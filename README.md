@@ -143,6 +143,28 @@ Entries flagged `needs_human_review: true` (ambiguous cases or confidence < 0.7)
 
 ---
 
+## Law Extraction (`doc_processing/extract_laws.py`)
+
+The processor classifies one **page** at a time, so a five-page act counts as five entries and a page shared by two acts is credited to both. `extract_laws.py` regroups the reviewed page-level results into complete **laws**.
+
+```bash
+python3 doc_processing/extract_laws.py            # no dependencies beyond the standard library
+python3 doc_processing/extract_laws.py --verify   # also re-classify each law's full text with the LLM
+```
+
+How it works:
+
+- **Unit of a law.** Session-law volumes are split into acts (`CHAPTER 64.` / `AN ACT ...` through `Approved March 18, 1908.`). Compiled codes and school-law compilations are split into numbered sections (`§ 4363.`), the way they are cited. Volumes with neither structure (e.g. the Judicial Dictionary) keep one law per page.
+- **Shared pages.** When a flagged page holds more than one law, the finding goes to the law that uses racial language on that page; for implicit pages, to the law whose text best matches the page's LLM title and keywords.
+- **Index and contents pages** are set aside, since they list acts rather than contain them.
+- **Reviewer work carries over**: `reviewed`, `reviewer_note` and corrected categories from the page entries are kept on each law.
+- `key_provisions` holds the sections of the law, on its flagged pages, that use racial language, so a 150-page act still points to its segregation clause.
+- Laws are flagged `needs_review` when the attribution relied on title matching, the act's end wasn't found, the act runs over 40 pages, or (with `--verify`) the LLM does not confirm it on the full text. Identical laws (pages repeated in a scan) are marked with `duplicate_of`.
+
+Output in `law_results/`: `laws.json` and `laws.csv` (one row per law, with citation, page range, flagged pages, category, full text and provenance), `page_to_law.csv` (each flagged page → its law) and `excluded_pages.csv`.
+
+---
+
 ## Reviewer UI (`reviewer/`)
 
 A Gradio web app for human reviewers to review, correct, and sign off on LLM classifications before the data goes into the archive database.
