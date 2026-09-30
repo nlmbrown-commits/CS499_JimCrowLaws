@@ -308,7 +308,8 @@ KEYWORDS = [
     "jim crow", "segregation", "separate but equal",
     "colored", "negro", "white only", "colored only",
     "racial discrimination", "miscegenation",
-    "poll tax", "literacy test", "grandfather clause", "marriage"
+    "poll tax", "literacy test", "grandfather clause", "marriage",
+    "jail", "prison"
 ]
 
 
