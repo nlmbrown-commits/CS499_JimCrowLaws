@@ -11,6 +11,8 @@ Output: law_results/jim_crow_laws.xlsx with one sheet per view:
     Laws Before Removing Duplicates  every extracted law
     Unique Laws                      laws with duplicate_of empty
     Marked for Human Check           unique laws with needs_review = true
+    Distinct Statutes                one row per statute, all its printings grouped
+    Possible Matches                 law pairs that may be the same statute, for review
 """
 
 import json
@@ -53,9 +55,26 @@ LAW_COLUMNS = [
     ("Summary (LLM)", "summary", 60), ("Key Provisions", "key_provisions", 80),
     ("Attribution", "attribution", 20), ("End Found", "boundary_found", 10), ("Reviewed", "reviewed", 10),
     ("Reviewer Notes", "reviewer_notes", 30), ("Needs Review", "needs_review", 12),
-    ("Duplicate Of", "duplicate_of", 45), ("Source File", "source_filename", 34), ("Full Text", "full_text", 80),
+    ("Duplicate Of", "duplicate_of", 45), ("Statute Citation", "statute_citation", 30),
+    ("Printings of Statute", "statute_printings", 11), ("Statute Years", "statute_years", 12),
+    ("Statute ID", "statute_id", 45), ("Title (Original OCR)", "title_raw", 60),
+    ("Source File", "source_filename", 34), ("Full Text", "full_text", 80),
 ]
-WRAP_KEYS = {"title", "summary", "key_provisions", "full_text", "ocr_text", "page_title", "reviewer_note", "reviewer_notes"}
+STATUTE_COLUMNS = [
+    ("Statute Citation", "statute_citation", 34), ("Title", "title", 60), ("Unit Type", "unit_type", 10),
+    ("Printings", "printings", 10), ("First Year", "first_year", 10), ("Last Year", "last_year", 10),
+    ("Category", "category", 18), ("Racial Indicator", "racial_indicator", 14),
+    ("Needs Review", "needs_review", 12), ("Grouped By", "grouped_by", 24),
+    ("Citations of Each Printing", "citations", 70), ("Summary (LLM)", "summary", 60),
+    ("Statute ID", "statute_id", 45), ("Law IDs", "law_ids", 60),
+]
+POSSIBLE_COLUMNS = [
+    ("Similarity", "similarity", 10), ("Citation A", "citation_a", 55), ("Citation B", "citation_b", 55),
+    ("Law ID A", "law_id_a", 45), ("Law ID B", "law_id_b", 45),
+    ("Statute ID A", "statute_id_a", 45), ("Statute ID B", "statute_id_b", 45),
+]
+WRAP_KEYS = {"title", "title_raw", "summary", "key_provisions", "full_text", "ocr_text", "page_title",
+             "reviewer_note", "reviewer_notes", "citations", "law_ids", "citation_a", "citation_b"}
 
 
 def cell_value(value):
@@ -92,6 +111,10 @@ def add_sheet(wb, name, columns, rows):
     ws.freeze_panes = "B2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{max(len(rows) + 1, 1)}"
     return ws
+
+
+def column_of(columns, key):
+    return get_column_letter(next(i for i, (_, k, _) in enumerate(columns, 1) if k == key))
 
 
 def load_flagged_pages(laws_by_page, excluded_pages):
@@ -146,6 +169,10 @@ def main():
         ("Laws Before Removing Duplicates", LAW_COLUMNS, laws, "Every law extracted from the flagged pages"),
         ("Unique Laws", LAW_COLUMNS, unique, "Laws with no identical earlier copy (Duplicate Of is empty)"),
         ("Marked for Human Check", LAW_COLUMNS, review, "Unique laws with Needs Review = Yes"),
+        ("Distinct Statutes", STATUTE_COLUMNS, data["statutes"],
+         "Unique laws with every printing of the same statute (across editions) grouped into one row"),
+        ("Possible Matches", POSSIBLE_COLUMNS, data["possible_matches"],
+         "Law pairs with similar text that were NOT grouped; a person should decide whether they are one statute"),
     ]
     for name, cols, rows, _ in sheets:
         add_sheet(wb, name, cols, rows)
@@ -165,16 +192,26 @@ def main():
     r = 4 + len(sheets) + 1
     summary.cell(row=r, column=1, value="Flagged pages attributed to a law").font = body
     summary.cell(row=r, column=2, value="=COUNTIF('Flagged Pages'!L:L,\"Part of a law\")").font = body
-    summary.cell(row=r + 1, column=1, value="Laws by type (unique)").font = bold
-    for i, t in enumerate(["act", "section", "page"]):
-        summary.cell(row=r + 2 + i, column=1, value=f"  {t}").font = body
-        summary.cell(row=r + 2 + i, column=2, value=f"=COUNTIF('Unique Laws'!G:G,\"{t}\")").font = body
-    notes_row = r + 6
+    summary.cell(row=r + 1, column=1, value="Distinct statutes needing review").font = body
+    summary.cell(row=r + 1, column=2, value=f"=COUNTIF('Distinct Statutes'!{column_of(STATUTE_COLUMNS, 'needs_review')}:"
+                 f"{column_of(STATUTE_COLUMNS, 'needs_review')},\"Yes\")").font = body
+    for block, (label, sheet, cols) in enumerate([("Unique laws by type", "Unique Laws", LAW_COLUMNS),
+                                                  ("Distinct statutes by type", "Distinct Statutes", STATUTE_COLUMNS)]):
+        top = r + 3 + block * 5
+        letter = column_of(cols, "unit_type")
+        summary.cell(row=top, column=1, value=label).font = bold
+        for i, t in enumerate(["act", "section", "page"]):
+            summary.cell(row=top + 1 + i, column=1, value=f"  {t}").font = body
+            summary.cell(row=top + 1 + i, column=2, value=f"=COUNTIF('{sheet}'!{letter}:{letter},\"{t}\")").font = body
+    notes_row = r + 13
     notes = [
         "Notes",
         "Source: law_results/laws.json, produced by doc_processing/extract_laws.py from doc_processing_results/.",
         "A law is one act in session-law volumes, one numbered section (§) in compiled codes, or one page where neither structure exists.",
         f"Cells longer than Excel's {EXCEL_CELL_LIMIT:,}-character limit are truncated; laws.json has the full text.",
+        "A statute groups the printings of one law across editions: the same Kentucky Statutes § number, "
+        "or near-identical text printed in different volumes. Session-law acts are never merged with each other.",
+        "Titles have OCR word boundaries repaired; 'Title (Original OCR)' keeps the text as scanned.",
     ]
     for i, n in enumerate(notes):
         summary.cell(row=notes_row + i, column=1, value=n).font = bold if i == 0 else body

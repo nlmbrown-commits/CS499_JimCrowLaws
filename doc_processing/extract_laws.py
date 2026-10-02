@@ -24,6 +24,8 @@ Usage:
 Output (law_results/):
     laws.json        one record per law, with full text and provenance
     laws.csv         same, flattened for spreadsheets
+    statutes.csv     one row per distinct statute (all printings of it grouped)
+    possible_matches.csv  section pairs that may be the same statute, for review
     page_to_law.csv  every flagged page → the law it was attributed to
     excluded_pages.csv  flagged pages that are not laws (index/contents)
 """
@@ -38,6 +40,9 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+sys.path.insert(0, str(Path(__file__).parent))
+from text_cleanup import TitleCleaner, shorten, wordninja  # noqa: E402
 
 ROOT = Path(__file__).parent.parent
 RESULTS_DIR = ROOT / "doc_processing_results"
@@ -296,17 +301,36 @@ def slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
 
+# Where an act's title ends: the enacting clause, a preamble, or the first section/article.
+ACT_TITLE_END_RE = re.compile(
+    r"\s(?:Be\s*it\s*enacted|WHEREAS|Whereas|§\s*1\b|\$\s*1\b|SEC(?:TION)?\.?\s*1\b|ARTICLE\s+I\b)")
+# A code section's catchline: "§ 4442. Levy and collection of tax. Said tax ..." / "...tax.- It shall"
+CATCHLINE_END_RE = re.compile(r"\.\s*[-—]?\s+(?=[A-Z(\[])|\.\s*[-—]")
+MAX_TITLE_CHARS = 300
+MAX_CATCHLINE_CHARS = 160
+
+
 def act_title(unit: Unit) -> str:
     """'AN ACT for additional improvements ... Colored Persons.' up to the enacting clause."""
-    text = " ".join(l.text.strip() for l in unit.lines)
-    m = re.search(r"AN\s*ACT.*?(?=Be\s+it\s+enacted|§\s*1\b|\$\s*1\b|SEC(?:TION)?\.?\s*1\b|$)", text, re.S)
-    title = m.group(0) if m else text
-    return re.sub(r"\s+", " ", title).strip()[:400]
+    text = re.sub(r"\s+", " ", " ".join(l.text.strip() for l in unit.lines))
+    m = re.search(r"AN\s*ACT", text)
+    title = text[m.start():] if m else text
+    end = ACT_TITLE_END_RE.search(title)
+    return (title[:end.start()] if end else title).strip()
 
 
 def section_title(unit: Unit) -> str:
-    first = re.sub(r"\s+", " ", " ".join(l.text.strip() for l in unit.lines[:3])).strip()
-    return first[:200]
+    """'§ 4442. Levy and collection of tax.' — the number and its catchline."""
+    text = re.sub(r"\s+", " ", " ".join(l.text.strip() for l in unit.lines[:6])).strip()
+    number = SECTION_RE.match(text)
+    start = number.end() if number else 0
+    # Skip a compilation's cross-reference: "§ 155. (§ 4477 Ky. St.) Free Tuition..."
+    ref = re.match(r"\s*\(\s*§[^)]*\)", text[start:])
+    body_start = start + (ref.end() if ref else 0)
+    end = CATCHLINE_END_RE.search(text, body_start + 3)
+    if end and end.start() - body_start <= MAX_CATCHLINE_CHARS:
+        return text[:end.start() + 1]
+    return text
 
 
 def key_provisions(unit: Unit, pages: List[int]) -> List[str]:
@@ -396,12 +420,21 @@ def build_law(unit: Unit, flagged: List[Tuple[dict, str]], source: dict, filenam
     }
 
 
-def extract_from_file(path: Path) -> Tuple[List[dict], List[dict], List[dict]]:
-    """Returns (laws, page_links, excluded_pages) for one classified results file."""
+def extract_from_file(path: Path, llm_text: Optional[List[str]] = None) -> Tuple[List[dict], List[dict], List[dict]]:
+    """
+    Returns (laws, page_links, excluded_pages) for one classified results file.
+
+    If llm_text is given, the LLM's page titles, summaries and keywords are appended to
+    it; they are well-spaced text used to learn the vocabulary for cleaning titles.
+    """
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     source = data.get("source_document", {})
     entries = data.get("entries", [])
+    if llm_text is not None:
+        for e in entries:
+            c = e["classification"]
+            llm_text.extend([c.get("title") or "", c.get("summary") or "", " ".join(c.get("keywords") or [])])
     flagged_entries = [e for e in entries if e["classification"].get("is_jim_crow") == "yes"]
     if not flagged_entries:
         return [], [], []
@@ -448,6 +481,21 @@ def extract_from_file(path: Path) -> Tuple[List[dict], List[dict], List[dict]]:
     return laws, links, excluded
 
 
+def clean_titles(laws: List[dict], llm_text: List[str]) -> None:
+    """Repair OCR word boundaries in titles; the original is kept as title_raw."""
+    if wordninja is None:
+        print("  (wordninja not installed: titles get punctuation fixes only. pip install wordninja)")
+    cleaner = TitleCleaner(TitleCleaner.domain_words(llm_text))
+    for law in laws:
+        law["title_raw"] = law["title"]
+        if law["unit_type"] == "page" and law["page_titles"]:
+            # A loose page has no heading of its own; the LLM's title for it reads better
+            # than its first OCR line (often a running head or a fragment).
+            law["title"] = law["page_titles"][0]
+        else:
+            law["title"] = shorten(cleaner.clean(law["title"]), MAX_TITLE_CHARS)
+
+
 def mark_duplicates(laws: List[dict]) -> None:
     """Flag laws whose text is identical to an earlier one (same volume scanned twice)."""
     seen: Dict[str, str] = {}
@@ -464,6 +512,190 @@ def dedupe_ids(laws: List[dict]) -> None:
         counts[law["law_id"]] += 1
         if counts[law["law_id"]] > 1:
             law["law_id"] = f"{law['law_id']}_{counts[law['law_id']]}"
+
+
+# ---------------------------------------------------------------------------
+# Grouping editions: the same statute reprinted in several compilations
+# ---------------------------------------------------------------------------
+
+# Editions of Carroll's/Baldwin's Kentucky Statutes (1894–1926) share one section numbering.
+KY_STATUTES_VOLUME_RE = re.compile(r"kentucky statute", re.IGNORECASE)
+# School-law compilations cite it: "§ 155. (§ 4477 Ky. St.) Free Tuition..."
+KY_STATUTES_REF_RE = re.compile(r"\(\s*§\s*(\d+[a-z]?(?:-\d+[a-z]?)?)\s*,?\s*Ky\s*\.?\s*St", re.IGNORECASE)
+OWN_NUMBER_RE = re.compile(r"^\s*#*\s*(?:§+|\$|SEC\.?|SECTION)\s*[\w-]+\s*\.", re.IGNORECASE)
+CROSS_REF_RE = re.compile(r"\(\s*§[^)]*\)")
+
+OPENING_CHARS = 600     # compare statute openings; trailing case notes differ between editions
+SHINGLE = 6
+SAME_TEXT = 0.6         # opening similarity at or above which two sections are one statute
+POSSIBLE_MATCH = 0.4    # between this and SAME_TEXT: listed for a human to decide
+COMMON_SHINGLE = 80     # shingles shared by more laws than this are boilerplate
+
+
+def ky_statutes_number(law: dict) -> Optional[str]:
+    """The Kentucky Statutes § number a section is (or cites), if it has one."""
+    if law["unit_type"] != "section" or not law["number"]:
+        return None
+    if KY_STATUTES_VOLUME_RE.search(law["volume_title"] or ""):
+        number = law["number"].lower()
+    else:
+        m = KY_STATUTES_REF_RE.search(law["full_text"][:150])
+        if not m:
+            return None
+        number = m.group(1).lower()
+    # "§ 1." of an act or constitution printed inside a code identifies nothing.
+    return number if re.match(r"\d{3}", number) else None
+
+
+def opening_shingles(law: dict) -> set:
+    text = CROSS_REF_RE.sub("", OWN_NUMBER_RE.sub("", law["full_text"]))
+    s = re.sub(r"[^a-z]", "", text.lower())[:OPENING_CHARS]  # OCR drops spaces, so ignore them
+    return {s[i:i + SHINGLE] for i in range(len(s) - SHINGLE + 1)}
+
+
+def group_editions(laws: List[dict]) -> List[dict]:
+    """
+    Assign every law a statute_id shared by all printings of the same statute.
+
+    Two printings are linked when
+      * both carry the same Kentucky Statutes § number (an edition's own number,
+        or a school-law compilation's "(§ 4477 Ky. St.)" reference);
+      * two code sections or pages open with near-identical text (catches renumbering
+        and OCR-misread numbers such as "45214" for "4521a"); or
+      * two acts are the same chapter of the same year's session laws.
+
+    Acts are otherwise never merged: each act is a separate enactment, even when its
+    wording repeats an earlier one. Similar text never merges two laws that would put
+    two printings from the same volume into one statute: the charters for each class
+    of city carry near-identical "separate schools" sections that are distinct laws,
+    and a single volume prints them side by side. Those pairs, and pairs with only
+    moderately similar openings, are returned as possible matches for review.
+    Exact duplicates follow their original.
+    """
+    unique = [l for l in laws if not l.get("duplicate_of")]
+    parent = list(range(len(unique)))
+    volumes = [{l["source_filename"]} for l in unique]  # per root: volumes in the group
+    how: Dict[int, set] = defaultdict(set)
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b, reason, guarded=False):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            if guarded and volumes[ra] & volumes[rb]:
+                return False
+            parent[rb] = ra
+            volumes[ra] |= volumes[rb]
+        how[a].add(reason)
+        how[b].add(reason)
+        return True
+
+    by_key: Dict[Tuple, List[int]] = defaultdict(list)
+    for i, law in enumerate(unique):
+        number = ky_statutes_number(law)
+        if number:
+            by_key[("ky_st", number)].append(i)
+        if law["unit_type"] == "act" and law["number"]:
+            by_key[("act", law["year"], law["number"].upper())].append(i)
+    for key, members in by_key.items():
+        for other in members[1:]:
+            union(members[0], other, "same Ky. St. section" if key[0] == "ky_st" else "same act")
+
+    # Text similarity between code sections and pages, via an inverted shingle index.
+    textual = [i for i, l in enumerate(unique) if l["unit_type"] in ("section", "page")]
+    shingles = {i: opening_shingles(unique[i]) for i in textual}
+    index: Dict[str, List[int]] = defaultdict(list)
+    for i in textual:
+        for s in shingles[i]:
+            index[s].append(i)
+    shared: Counter = Counter()
+    for members in index.values():
+        if len(members) > COMMON_SHINGLE:
+            continue
+        for x in range(len(members)):
+            for y in range(x + 1, len(members)):
+                shared[(members[x], members[y])] += 1
+
+    pairs = sorted(((n / len(shingles[a] | shingles[b]), a, b) for (a, b), n in shared.items()), reverse=True)
+    possible = []
+    for sim, a, b in pairs:
+        if sim < POSSIBLE_MATCH:
+            break
+        if sim >= SAME_TEXT and union(a, b, "same text", guarded=True):
+            continue
+        if unique[a]["source_filename"] != unique[b]["source_filename"]:
+            possible.append((sim, a, b))
+
+    groups: Dict[int, List[int]] = defaultdict(list)
+    for i in range(len(unique)):
+        groups[find(i)].append(i)
+
+    statute_of: Dict[str, str] = {}
+    for members in groups.values():
+        members.sort(key=lambda i: (unique[i]["year"] or 9999, unique[i]["law_id"]))
+        first = unique[members[0]]
+        numbers = sorted({ky_statutes_number(unique[i]) for i in members} - {None})
+        statute_id = f"statute_{first['law_id']}"
+        statute_citation = (f"Ky. Stat. § {numbers[0]}" if len(numbers) == 1
+                            else f"Ky. Stat. §§ {', '.join(numbers)}" if numbers else first["citation"])
+        years = sorted({unique[i]["year"] for i in members if unique[i]["year"]})
+        for i in members:
+            law = unique[i]
+            law["statute_id"] = statute_id
+            law["statute_citation"] = statute_citation
+            law["statute_printings"] = len(members)
+            law["statute_years"] = f"{years[0]}–{years[-1]}" if len(years) > 1 else (str(years[0]) if years else None)
+            law["grouped_by"] = sorted(how[i])
+            statute_of[law["law_id"]] = statute_id
+    for law in laws:
+        if law.get("duplicate_of"):
+            original = next(l for l in unique if l["law_id"] == law["duplicate_of"])
+            for k in ("statute_id", "statute_citation", "statute_printings", "statute_years", "grouped_by"):
+                law[k] = original[k]
+
+    return [
+        {"similarity": round(sim, 2),
+         "law_id_a": unique[a]["law_id"], "citation_a": unique[a]["citation"], "statute_id_a": unique[a]["statute_id"],
+         "law_id_b": unique[b]["law_id"], "citation_b": unique[b]["citation"], "statute_id_b": unique[b]["statute_id"]}
+        for sim, a, b in sorted(possible, reverse=True)
+        if unique[a]["statute_id"] != unique[b]["statute_id"]
+    ]
+
+
+def summarize_statutes(laws: List[dict]) -> List[dict]:
+    """One row per statute: its printings, years, and whether any printing is settled."""
+    by_statute: Dict[str, List[dict]] = defaultdict(list)
+    for law in laws:
+        if not law.get("duplicate_of"):
+            by_statute[law["statute_id"]].append(law)
+    rows = []
+    for statute_id, members in by_statute.items():
+        members.sort(key=lambda l: (l["year"] or 9999, l["law_id"]))
+        first = members[0]
+        categories = Counter(l["category"] for l in members if l["category"])
+        rows.append({
+            "statute_id": statute_id,
+            "statute_citation": first["statute_citation"],
+            "title": first["title"],
+            "unit_type": first["unit_type"],
+            "printings": len(members),
+            "first_year": first["year"],
+            "last_year": members[-1]["year"],
+            "category": categories.most_common(1)[0][0] if categories else None,
+            "racial_indicator": "explicit" if any(l["racial_indicator"] == "explicit" for l in members) else first["racial_indicator"],
+            # Settled if any printing was attributed without doubt.
+            "needs_review": all(l["needs_review"] for l in members),
+            "grouped_by": sorted({g for l in members for g in l["grouped_by"]}),
+            "citations": [l["citation"] for l in members],
+            "law_ids": [l["law_id"] for l in members],
+            "summary": first["summary"],
+        })
+    rows.sort(key=lambda r: (r["first_year"] or 9999, r["statute_id"]))
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -505,11 +737,16 @@ def verify_with_llm(laws: List[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 CSV_FIELDS = [
-    "law_id", "citation", "title", "volume_title", "year", "document_type", "unit_type",
+    "law_id", "citation", "title", "title_raw", "volume_title", "year", "document_type", "unit_type",
     "number", "heading", "page_start", "page_end", "page_count", "jim_crow_pages", "category",
     "racial_indicator", "confidence", "summary", "attribution", "boundary_found", "reviewed",
-    "reviewer_notes", "needs_review", "duplicate_of", "law_level_is_jim_crow", "source_filename",
+    "reviewer_notes", "needs_review", "duplicate_of", "statute_id", "statute_citation",
+    "statute_printings", "statute_years", "grouped_by", "law_level_is_jim_crow", "source_filename",
     "full_text",
+]
+STATUTE_FIELDS = [
+    "statute_id", "statute_citation", "title", "unit_type", "printings", "first_year", "last_year",
+    "category", "racial_indicator", "needs_review", "grouped_by", "citations", "law_ids", "summary",
 ]
 
 
@@ -531,9 +768,9 @@ def main() -> None:
     files = sorted(args.results_dir.glob("*_classified.json"))
     print(f"Reading {len(files)} classified files from {args.results_dir}")
 
-    laws, links, excluded = [], [], []
+    laws, links, excluded, llm_text = [], [], [], []
     for path in files:
-        l, k, x = extract_from_file(path)
+        l, k, x = extract_from_file(path, llm_text)
         laws += l
         links += k
         excluded += x
@@ -541,6 +778,8 @@ def main() -> None:
 
     dedupe_ids(laws)
     mark_duplicates(laws)
+    clean_titles(laws, llm_text)
+    possible_matches = group_editions(laws)
     if args.verify:
         print(f"Verifying {len(laws)} laws with the LLM...")
         verify_with_llm(laws)
@@ -550,6 +789,7 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     unique = [l for l in laws if not l["duplicate_of"]]
+    statutes = summarize_statutes(laws)
     stats = {
         "flagged_pages": flagged_pages,
         "excluded_pages": len(excluded),
@@ -558,12 +798,19 @@ def main() -> None:
         "by_unit_type": dict(Counter(l["unit_type"] for l in unique)),
         "by_attribution": dict(Counter(m for l in unique for m in l["attribution"])),
         "needs_review": sum(l["needs_review"] for l in unique),
+        "distinct_statutes": len(statutes),
+        "distinct_statutes_by_unit_type": dict(Counter(s["unit_type"] for s in statutes)),
+        "distinct_statutes_needing_review": sum(s["needs_review"] for s in statutes),
+        "possible_matches": len(possible_matches),
     }
     with open(args.out_dir / "laws.json", "w", encoding="utf-8") as f:
-        json.dump({"statistics": stats, "laws": laws, "excluded_pages": excluded}, f, indent=2, ensure_ascii=False)
+        json.dump({"statistics": stats, "laws": laws, "statutes": statutes, "excluded_pages": excluded,
+                   "possible_matches": possible_matches}, f, indent=2, ensure_ascii=False)
     write_csv(args.out_dir / "laws.csv", laws, CSV_FIELDS)
     write_csv(args.out_dir / "page_to_law.csv", links, ["source_filename", "page_number", "law_id", "attribution"])
     write_csv(args.out_dir / "excluded_pages.csv", excluded, ["source_filename", "page_number", "reason", "page_title"])
+    write_csv(args.out_dir / "statutes.csv", statutes, STATUTE_FIELDS)
+    write_csv(args.out_dir / "possible_matches.csv", possible_matches, list(possible_matches[0]) if possible_matches else [])
 
     print(f"\nFlagged pages       : {stats['flagged_pages']}")
     print(f"  index/contents    : {stats['excluded_pages']} (excluded)")
@@ -571,6 +818,8 @@ def main() -> None:
     for k, v in stats["by_unit_type"].items():
         print(f"  {k:<18}: {v}")
     print(f"Needs review        : {stats['needs_review']}")
+    print(f"Distinct statutes   : {stats['distinct_statutes']} ({stats['distinct_statutes_needing_review']} need review)")
+    print(f"Possible matches    : {stats['possible_matches']} pairs left for a human to decide")
     print(f"Output              : {args.out_dir}/")
 
 

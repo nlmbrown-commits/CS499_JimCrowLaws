@@ -13,10 +13,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "doc_processing"))
 
 from extract_laws import (
     choose_mode,
+    group_editions,
     extract_from_file,
     is_index_page,
     segment,
     strip_running_header,
+    summarize_statutes,
 )
 
 
@@ -151,3 +153,108 @@ class TestExtraction:
         laws, _, _ = extract_from_file(_write(tmp_path, pages + FILLER))
         assert laws[0]["reviewed"] is True
         assert laws[0]["reviewer_notes"] == ["checked against scan"]
+
+
+def _law(law_id, volume, year, unit_type, number, text, needs_review=False):
+    return {
+        "law_id": law_id, "source_filename": f"{volume}.pdf", "volume_title": volume, "year": year,
+        "unit_type": unit_type, "number": number, "title": text[:40], "citation": f"{volume}, {year}, § {number}",
+        "category": "education", "racial_indicator": "explicit", "summary": "", "needs_review": needs_review,
+        "duplicate_of": None, "full_text": text,
+    }
+
+
+SEPARATE_SCHOOLS = ("Said board of education shall provide and maintain, out of the funds levied, "
+                    "separate schools for white and colored pupils, and shall employ teachers for each, "
+                    "and no white child shall attend a school for colored children nor any colored child "
+                    "a school for white children within the limits of the said city.")
+
+
+class TestGroupEditions:
+    def test_same_ky_statutes_number_across_editions(self):
+        laws = [
+            _law("a", "The Kentucky Statutes, Third Edition", 1903, "section", "4477", "§ 4477. Free tuition to white children."),
+            _law("b", "The Kentucky Statutes, Sixth Edition", 1922, "section", "4477", "§ 4477. A note on a case about tuition."),
+            _law("c", "Common School Laws of Kentucky", 1916, "section", "155", "§ 155. (§ 4477 Ky. St.) Free Tuition."),
+        ]
+        group_editions(laws)
+        assert len({l["statute_id"] for l in laws}) == 1
+        assert laws[0]["statute_citation"] == "Ky. Stat. § 4477"
+        assert laws[0]["statute_years"] == "1903–1922"
+
+    def test_same_text_under_misread_number(self):
+        laws = [
+            _law("a", "The Kentucky Statutes, Third Edition", 1903, "section", "45214", "§ 45214. " + SEPARATE_SCHOOLS),
+            _law("b", "The Kentucky Statutes, Fourth Edition", 1909, "section", "4521a", "§ 4521a. " + SEPARATE_SCHOOLS),
+        ]
+        group_editions(laws)
+        assert laws[0]["statute_id"] == laws[1]["statute_id"]
+
+    def test_parallel_sections_in_one_volume_stay_apart(self):
+        laws = [
+            _law("a", "The Kentucky Statutes, Third Edition", 1903, "section", "3470", "§ 3470. " + SEPARATE_SCHOOLS),
+            _law("b", "The Kentucky Statutes, Third Edition", 1903, "section", "3596", "§ 3596. " + SEPARATE_SCHOOLS),
+            _law("c", "The Kentucky Statutes, Sixth Edition", 1922, "section", "3470", "§ 3470. " + SEPARATE_SCHOOLS),
+        ]
+        possible = group_editions(laws)
+        assert laws[0]["statute_id"] == laws[2]["statute_id"]
+        assert laws[1]["statute_id"] != laws[0]["statute_id"]
+        assert {p["law_id_a"] for p in possible} | {p["law_id_b"] for p in possible} >= {"b"}
+
+    def test_acts_with_similar_wording_stay_apart(self):
+        laws = [
+            _law("a", "Acts 1920", 1920, "act", "95", "AN ACT appropriating money for colored schools."),
+            _law("b", "Acts 1930", 1930, "act", "164", "AN ACT appropriating money for colored schools."),
+            _law("c", "Acts 1930 v2", 1930, "act", "164", "AN ACT appropriating money for colored schools."),
+        ]
+        group_editions(laws)
+        assert laws[0]["statute_id"] != laws[1]["statute_id"]
+        assert laws[1]["statute_id"] == laws[2]["statute_id"]
+
+    def test_statute_settled_if_any_printing_is(self):
+        laws = [
+            _law("a", "The Kentucky Statutes, Third Edition", 1903, "section", "4477", "§ 4477. Tuition.", needs_review=True),
+            _law("b", "The Kentucky Statutes, Sixth Edition", 1922, "section", "4477", "§ 4477. Tuition."),
+        ]
+        group_editions(laws)
+        [statute] = summarize_statutes(laws)
+        assert statute["printings"] == 2 and statute["needs_review"] is False
+
+
+class TestTitleCleaner:
+    @classmethod
+    def setup_class(cls):
+        import pytest
+        pytest.importorskip("wordninja")
+        from text_cleanup import TitleCleaner
+        domain = TitleCleaner.domain_words(
+            ["Garrard County schools", "Cloverport school district", "Breckinridge County"] * 5
+            + ["the said county shall provide schools for colored children"] * 50
+        )
+        cls.cleaner = TitleCleaner(domain)
+
+    def test_splits_glued_words(self):
+        assert (self.cleaner.clean("Be itenactedby theGeneral Assembly of theCommonwealth ofKentucky :")
+                == "Be it enacted by the General Assembly of the Commonwealth of Kentucky:")
+
+    def test_rejoins_line_break_hyphens(self):
+        assert self.cleaner.clean("in the life- timeof theparties") == "in the lifetime of the parties"
+        assert self.cleaner.clean("any religiousdenom- ination") == "any religious denomination"
+
+    def test_keeps_catchline_dashes(self):
+        assert (self.cleaner.clean("§ 283. Coloreddeafmutes- termsofadmission- appropriation.")
+                == "§ 283. Colored deaf mutes—terms of admission—appropriation.")
+
+    def test_fixes_section_symbol_and_spacing(self):
+        assert self.cleaner.clean("$ 4534 . Appropriation for teachers .") == "§ 4534. Appropriation for teachers."
+
+    def test_leaves_place_names_alone(self):
+        assert self.cleaner.clean("public schools in Cloverport, Garrard county") == "public schools in Cloverport, Garrard county"
+
+    def test_shall_not_hall(self):
+        assert self.cleaner.clean("the purposeshallbe") == "the purpose shall be"
+
+
+def test_shorten_cuts_at_word_boundary():
+    from text_cleanup import shorten
+    assert shorten("Separate schools for white and colored children", 20) == "Separate schools for…"

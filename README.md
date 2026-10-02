@@ -159,9 +159,13 @@ How it works:
 - **Index and contents pages** are set aside, since they list acts rather than contain them.
 - **Reviewer work carries over**: `reviewed`, `reviewer_note` and corrected categories from the page entries are kept on each law.
 - `key_provisions` holds the sections of the law, on its flagged pages, that use racial language, so a 150-page act still points to its segregation clause.
+- **Editions are grouped into statutes.** The same law reprinted in several compilations (e.g. Ky. Stat. § 4477 in the 1903, 1909, 1915 and 1922 editions and the school-law compilations) shares a `statute_id`. Printings are linked by the same Kentucky Statutes § number (including a compilation's "(§ 4477 Ky. St.)" reference) or by near-identical opening text in different volumes. Session-law acts are separate enactments and are never merged with one another. Two laws printed in the same volume are never merged on text alone, because the charters for each class of city carry near-identical "separate schools" sections that are distinct laws; such pairs are listed in `possible_matches.csv` for a person to decide.
+- **Titles are cleaned.** OCR word boundaries are repaired ("Be itenactedby theGeneral Assembly" → "Be it enacted by the General Assembly", "Com- monwealth" → "Commonwealth") using `wordninja` plus a vocabulary of Kentucky place names and legal terms learned from the LLM's page summaries. Words it cannot split confidently are left as scanned, and `title_raw` keeps the original. Install with `pip install wordninja`; without it only punctuation is fixed.
 - Laws are flagged `needs_review` when the attribution relied on title matching, the act's end wasn't found, the act runs over 40 pages, or (with `--verify`) the LLM does not confirm it on the full text. Identical laws (pages repeated in a scan) are marked with `duplicate_of`.
 
-Output in `law_results/`: `laws.json` and `laws.csv` (one row per law, with citation, page range, flagged pages, category, full text and provenance), `page_to_law.csv` (each flagged page → its law) and `excluded_pages.csv`.
+Output in `law_results/`: `laws.json` and `laws.csv` (one row per law, with citation, page range, flagged pages, category, full text and provenance), `statutes.csv` (one row per distinct statute), `possible_matches.csv`, `page_to_law.csv` (each flagged page → its law) and `excluded_pages.csv`.
+
+`python3 doc_processing/export_laws_xlsx.py` (needs `openpyxl`) writes all of it to `law_results/jim_crow_laws.xlsx`, one sheet per view plus a summary.
 
 ---
 
