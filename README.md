@@ -169,6 +169,27 @@ Output in `law_results/`: `laws.json` and `laws.csv` (one row per law, with cita
 
 ---
 
+## Chatbot (`chatbot/`) — "Ask the Archive"
+
+A question-answering assistant over the extracted laws, on the website's **Ask the Archive** tab and at `POST /chat` on the API server. It answers only from the archive and cites the statutes it used.
+
+```bash
+pip install flask flask-cors llama-index-core wordninja
+pip install llama-index-llms-anthropic   # or the package for your LLM_PROVIDER
+python3 api_server.py                    # then open http://localhost:5000 → Ask the Archive
+```
+
+It reads `law_results/laws.json`, so run `doc_processing/extract_laws.py` first. The model comes from the same `.env` settings as document processing (`LLM_PROVIDER`, `LLM_MODEL` and the provider's API key). Without them, the chatbot still returns the best-matching statutes, just with no written answer.
+
+For each question it:
+1. **Searches the 1,073 distinct statutes** (BM25 over cleaned titles, the provisions that use racial language, LLM summaries and opening text). Year phrases such as "in the 1890s", "before 1904" and "between 1890 and 1910" filter by the years the laws were printed. Follow-ups like "what about the 1920s?" carry the previous question's topic and years forward.
+2. **Computes exact counts** for that range (statutes by category, type and decade, and how many mention each question word), so "how many" questions get real numbers.
+3. **Asks the LLM to answer from those sources only**, citing them as [1], [2]. The model sees each law's own text (cleaned of OCR glue) separately from the AI page summary. A page summary can describe a neighbouring law printed on the same page, and the model is told to trust the text when the two disagree. Uncertain findings are flagged as needing review.
+
+API: `POST /chat` with `{"message": "...", "history": [{"role": "user"|"assistant", "content": "..."}]}` returns `{"answer", "sources", "facts", "mode"}`. `mode` is `llm`, or `retrieval_only` when no model is configured.
+
+---
+
 ## Reviewer UI (`reviewer/`)
 
 A Gradio web app for human reviewers to review, correct, and sign off on LLM classifications before the data goes into the archive database.

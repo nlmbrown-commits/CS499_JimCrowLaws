@@ -182,6 +182,47 @@ def get_keywords():
         return jsonify({"error": str(e)}), 500
 
 
+# ---------------------------------------------------------------------------
+# Chatbot: answers questions from law_results/laws.json (see chatbot/)
+# ---------------------------------------------------------------------------
+
+MAX_QUESTION_CHARS = 2000
+MAX_HISTORY_MESSAGES = 20
+_chat = None
+
+
+def get_chat():
+    """Load the archive once, on the first question."""
+    global _chat
+    if _chat is None:
+        from chatbot import ArchiveChat
+        _chat = ArchiveChat()
+    return _chat
+
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """Answer a question. Body: {"message": "...", "history": [{"role": "user"|"assistant", "content": "..."}]}"""
+    body = request.get_json(silent=True) or {}
+    message = str(body.get('message', '')).strip()[:MAX_QUESTION_CHARS]
+    history = body.get('history') or []
+    if not isinstance(history, list):
+        history = []
+    history = [
+        {"role": m.get("role"), "content": str(m.get("content", ""))[:MAX_QUESTION_CHARS * 4]}
+        for m in history[-MAX_HISTORY_MESSAGES:] if isinstance(m, dict)
+    ]
+    if not message:
+        return jsonify({"error": "message is required"}), 400
+    try:
+        return jsonify(get_chat().answer(message, history))
+    except FileNotFoundError:
+        return jsonify({"error": "law_results/laws.json not found. Run doc_processing/extract_laws.py first."}), 503
+    except Exception as e:
+        print(f"Chat error: {e}")
+        return jsonify({"error": "The assistant could not answer that question.", "details": str(e)}), 500
+
+
 @app.route('/health')
 def health_check():
     """Health check endpoint"""
